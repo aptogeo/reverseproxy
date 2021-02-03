@@ -43,7 +43,7 @@ type ReverseProxy struct {
 	allowCrossOrigin bool
 }
 
-// NewReverseProxy constructs GisProxy
+// NewReverseProxy constructs ReverseProxy
 func NewReverseProxy(forward string, allowCrossOrigin bool) *ReverseProxy {
 	rp := new(ReverseProxy)
 	rp.SetForward(forward)
@@ -94,15 +94,28 @@ func (rp *ReverseProxy) SetAfterReceiveFunc(afterReceiveFunc AfterReceive) {
 
 // ServeHTTP serves rest request
 func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	url := request.URL.String()
-	idx := strings.Index(url, "://")
+	url := rp.forward
+	requestURL := request.URL.String()
+	idx := strings.Index(requestURL, "://")
 	if idx != -1 {
-		url = url[idx+3:]
+		requestURL = requestURL[idx+3:]
 	}
 	re := regexp.MustCompile("/([/\\?]?.*)?")
-	submatch := re.FindStringSubmatch(url)
+	submatch := re.FindStringSubmatch(requestURL)
 	if submatch != nil && submatch[1] != "" {
-		url += submatch[1]
+		if strings.HasSuffix(url, "/") {
+			if strings.HasPrefix(submatch[1], "/") {
+				url += submatch[1][1:]
+			} else {
+				url += submatch[1]
+			}
+		} else {
+			if strings.HasPrefix(submatch[1], "/") {
+				url += submatch[1]
+			} else {
+				url += "/" + submatch[1]
+			}
+		}
 	}
 	res, err := rp.SendRequestWithContext(request.Context(), request.Method, url, request.Body, request.Header)
 	if err != nil {

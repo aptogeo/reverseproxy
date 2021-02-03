@@ -1,3 +1,3 @@
-module github.com/aptogeo/gisproxy
+module github.com/aptogeo/reverseproxy
 
 go 1.13
