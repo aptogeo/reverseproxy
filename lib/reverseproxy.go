@@ -35,6 +35,7 @@ type AfterReceive func(*http.Response) (*http.Response, error)
 
 // ReverseProxy structure
 type ReverseProxy struct {
+	prefix           string
 	forward          string
 	client           *http.Client
 	next             http.Handler
@@ -44,9 +45,10 @@ type ReverseProxy struct {
 }
 
 // NewReverseProxy constructs ReverseProxy
-func NewReverseProxy(forward string, allowCrossOrigin bool) *ReverseProxy {
+func NewReverseProxy(forward string, prefix string, allowCrossOrigin bool) *ReverseProxy {
 	rp := new(ReverseProxy)
 	rp.SetForward(forward)
+	rp.SetPrefix(prefix)
 	rp.SetAllowCrossOrigin(allowCrossOrigin)
 	// create http client
 	rp.client = &http.Client{}
@@ -65,6 +67,20 @@ func NewReverseProxy(forward string, allowCrossOrigin bool) *ReverseProxy {
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 	}
 	return rp
+}
+
+// SetPrefix sets prefix
+func (rp *ReverseProxy) SetPrefix(prefix string) {
+	rp.prefix = prefix
+	if rp.prefix == "" {
+		rp.prefix = "/"
+	}
+	if !strings.HasPrefix(rp.prefix, "/") {
+		rp.prefix = "/" + rp.prefix
+	}
+	if !strings.HasSuffix(rp.prefix, "/") {
+		rp.prefix = rp.prefix + "/"
+	}
 }
 
 // SetForward sets forward
@@ -100,20 +116,20 @@ func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	if idx != -1 {
 		requestURL = requestURL[idx+3:]
 	}
-	re := regexp.MustCompile("/([/\\?]?.*)?")
+	re := regexp.MustCompile("(" + rp.prefix + ")([/\\?]?.*)?")
 	submatch := re.FindStringSubmatch(requestURL)
-	if submatch != nil && submatch[1] != "" {
+	if submatch != nil && submatch[2] != "" {
 		if strings.HasSuffix(url, "/") {
-			if strings.HasPrefix(submatch[1], "/") {
-				url += submatch[1][1:]
+			if strings.HasPrefix(submatch[2], "/") {
+				url += submatch[2][1:]
 			} else {
-				url += submatch[1]
+				url += submatch[2]
 			}
 		} else {
-			if strings.HasPrefix(submatch[1], "/") {
-				url += submatch[1]
+			if strings.HasPrefix(submatch[2], "/") {
+				url += submatch[2]
 			} else {
-				url += "/" + submatch[1]
+				url += "/" + submatch[2]
 			}
 		}
 	}
