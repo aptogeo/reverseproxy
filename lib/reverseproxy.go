@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -13,45 +15,56 @@ import (
 
 // StatusError struct
 type StatusError struct {
-	Cause error
-	Code  int
+	Message string
+	Code    int
 }
 
 // NewStatusError constructs StatusError
-func NewStatusError(cause error, code int) *StatusError {
-	return &StatusError{Cause: cause, Code: code}
+func NewStatusError(message string, code int) *StatusError {
+	return &StatusError{Message: message, Code: code}
 }
 
 // Error implements the error interface
-func (e StatusError) Error() string {
-	return e.Cause.Error()
+func (e *StatusError) Error() string {
+	return e.Message
 }
 
 // BeforeSend defines before send callback function
-type BeforeSend func(*http.Request) (*http.Request, error)
+type BeforeSend func(*ReverseProxy, http.ResponseWriter, *http.Request, string) error
 
 // AfterReceive defines after receive callback function
-type AfterReceive func(*http.Response) (*http.Response, error)
+type AfterReceive func(*ReverseProxy, http.ResponseWriter, *http.Request, *http.Response) error
 
 // ReverseProxy structure
 type ReverseProxy struct {
-	prefix           string
-	forward          string
+	Listen           string
+	Prefix           string
+	Forward          string
+	Host             string
+	Https            bool
+	AllowCrossOrigin bool
 	client           *http.Client
-	next             http.Handler
 	beforeSendFunc   BeforeSend
 	afterReceiveFunc AfterReceive
-	allowCrossOrigin bool
+	crtFile          string
+	keyFile          string
 }
 
 // NewReverseProxy constructs ReverseProxy
-func NewReverseProxy(forward string, prefix string, allowCrossOrigin bool) *ReverseProxy {
+func NewReverseProxy(listen string, forward string, host string, prefix string, allowCrossOrigin bool) *ReverseProxy {
 	rp := new(ReverseProxy)
-	rp.SetForward(forward)
-	rp.SetPrefix(prefix)
-	rp.SetAllowCrossOrigin(allowCrossOrigin)
+	rp.Listen = listen
+	rp.Forward = forward
+	rp.Host = host
+	rp.Prefix = prefix
+	rp.AllowCrossOrigin = allowCrossOrigin
+	rp.Https = false
 	// create http client
-	rp.client = &http.Client{}
+	rp.client = &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	rp.client.Transport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -69,35 +82,6 @@ func NewReverseProxy(forward string, prefix string, allowCrossOrigin bool) *Reve
 	return rp
 }
 
-// SetPrefix sets prefix
-func (rp *ReverseProxy) SetPrefix(prefix string) {
-	rp.prefix = prefix
-	if rp.prefix == "" {
-		rp.prefix = "/"
-	}
-	if !strings.HasPrefix(rp.prefix, "/") {
-		rp.prefix = "/" + rp.prefix
-	}
-	if !strings.HasSuffix(rp.prefix, "/") {
-		rp.prefix = rp.prefix + "/"
-	}
-}
-
-// SetForward sets forward
-func (rp *ReverseProxy) SetForward(forward string) {
-	rp.forward = forward
-}
-
-// SetAllowCrossOrigin sets forward
-func (rp *ReverseProxy) SetAllowCrossOrigin(allowCrossOrigin bool) {
-	rp.allowCrossOrigin = allowCrossOrigin
-}
-
-// SetNextHandler sets next handler for middleware use
-func (rp *ReverseProxy) SetNextHandler(next http.Handler) {
-	rp.next = next
-}
-
 // SetBeforeSendFunc sets BeforeSend callback function
 func (rp *ReverseProxy) SetBeforeSendFunc(beforeSendFunc BeforeSend) {
 	rp.beforeSendFunc = beforeSendFunc
@@ -108,16 +92,43 @@ func (rp *ReverseProxy) SetAfterReceiveFunc(afterReceiveFunc AfterReceive) {
 	rp.afterReceiveFunc = afterReceiveFunc
 }
 
-// ServeHTTP serves rest request
-func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	url := rp.forward
-	requestURL := request.URL.String()
-	idx := strings.Index(requestURL, "://")
-	if idx != -1 {
-		requestURL = requestURL[idx+3:]
+// UseHttps uses Https with certificate
+func (rp *ReverseProxy) UseHttps(crtFile string, keyFile string) {
+	rp.Https = true
+	rp.crtFile = crtFile
+	rp.keyFile = keyFile
+}
+
+func (rp *ReverseProxy) Start() error {
+	log.Println("Start server with:", "Listen=", rp.Listen, "Forward=", rp.Forward, "Host=", rp.Host, "Prefix=", rp.Prefix, "AllowCrossOrigin=", rp.AllowCrossOrigin, "Https=", rp.Https, "CrtFile=", rp.crtFile, "KeyFile=", rp.keyFile)
+	if rp.Https {
+		http.HandleFunc("/", rp.serveHTTP)
+		return http.ListenAndServeTLS(rp.Listen, rp.crtFile, rp.keyFile, nil)
 	}
-	re := regexp.MustCompile("(" + rp.prefix + ")([/\\?]?.*)?")
-	submatch := re.FindStringSubmatch(requestURL)
+	http.HandleFunc("/", rp.serveHTTP)
+	return http.ListenAndServe(rp.Listen, nil)
+}
+
+// serveHTTP serves rest request
+func (rp *ReverseProxy) serveHTTP(writer http.ResponseWriter, incomingRequest *http.Request) {
+	if rp.Prefix == "" {
+		rp.Prefix = "/"
+	}
+	if !strings.HasPrefix(rp.Prefix, "/") {
+		rp.Prefix = "/" + rp.Prefix
+	}
+	if !strings.HasSuffix(rp.Prefix, "/") {
+		rp.Prefix = rp.Prefix + "/"
+	}
+	url := rp.Forward
+	incomingRequestURL := incomingRequest.URL.String()
+	incomingHost := incomingRequest.Host
+	idx := strings.Index(incomingRequestURL, "://")
+	if idx != -1 {
+		incomingRequestURL = incomingRequestURL[idx+3:]
+	}
+	re := regexp.MustCompile("(" + rp.Prefix + ")([/\\?]?.*)?")
+	submatch := re.FindStringSubmatch(incomingRequestURL)
 	if submatch != nil && submatch[2] != "" {
 		if strings.HasSuffix(url, "/") {
 			if strings.HasPrefix(submatch[2], "/") {
@@ -133,79 +144,120 @@ func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 			}
 		}
 	}
-	res, err := rp.SendRequestWithContext(request.Context(), request.Method, url, request.Body, request.Header)
+	response, err := rp.SendRequestWithContext(incomingRequest.Context(), writer, incomingHost, incomingRequest.Method, url, incomingRequest.Body, incomingRequest.Header)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
 	if err != nil {
-		statusError, valid := err.(*StatusError)
-		if valid {
-			http.Error(writer, "Requesting server "+url+" error: "+err.Error(), statusError.Code)
-		} else {
-			http.Error(writer, "Requesting server "+url+" error: "+err.Error(), http.StatusInternalServerError)
-		}
+		rp.writeError(writer, err, incomingHost)
 		return
 	}
-	rp.write(writer, res)
-	if err != nil {
-		http.Error(writer, "Writing response error", http.StatusInternalServerError)
-		return
-	}
-}
-
-// SendRequest sends request
-func (rp *ReverseProxy) SendRequest(method string, url string, body io.Reader, header http.Header) (*http.Response, error) {
-	return rp.SendRequestWithContext(context.Background(), method, url, body, header)
+	rp.writeResponse(writer, incomingRequest, response, incomingHost)
 }
 
 // SendRequestWithContext sends request with context
-func (rp *ReverseProxy) SendRequestWithContext(ctx context.Context, method string, url string, body io.Reader, header http.Header) (*http.Response, error) {
+func (rp *ReverseProxy) SendRequestWithContext(ctx context.Context, writer http.ResponseWriter, incomingHost string, method string, url string, body io.Reader, header http.Header) (*http.Response, error) {
 	// Create request
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	var request *http.Request
+	var err error
+	if method == "PUT" || method == "POST" || method == "PATCH" {
+		request, err = http.NewRequestWithContext(ctx, method, url, body)
+	} else {
+		request, err = http.NewRequestWithContext(ctx, method, url, nil)
+	}
 	if err != nil {
 		return nil, err
 	}
+	// Set host
+	request.Host = rp.Host
 	// Add request header
-	for n, h := range header {
-		for _, h := range h {
-			req.Header.Add(n, h)
+	for h, vs := range header {
+		for _, v := range vs {
+			request.Header.Add(h, v)
 		}
 	}
 	if rp.beforeSendFunc != nil {
 		// Call before send function
-		req, err = rp.beforeSendFunc(req)
+		err := rp.beforeSendFunc(rp, writer, request, incomingHost)
 		if err != nil {
 			return nil, err
 		}
 	}
 	// Send
-	return rp.client.Do(req)
+	return rp.client.Do(request)
 }
 
-func (rp *ReverseProxy) write(writer http.ResponseWriter, res *http.Response) error {
-	var err error
+func (rp *ReverseProxy) writeResponse(writer http.ResponseWriter, request *http.Request, response *http.Response, incomingHost string) {
 	if rp.afterReceiveFunc != nil {
 		// Call after receive function
-		res, err = rp.afterReceiveFunc(res)
+		err := rp.afterReceiveFunc(rp, writer, request, response)
 		if err != nil {
-			return err
+			rp.writeError(writer, err, incomingHost)
+			return
 		}
 	}
+	if response.StatusCode == 302 {
+		location, _ := response.Location()
+		rp.writeError(writer, NewStatusError(location.String(), 302), incomingHost)
+		return
+	}
+	// Write header
+	rp.writeResponseHeader(writer, response.Header)
+	// Set status
+	writer.WriteHeader(response.StatusCode)
+	// Copy body
+	_, err := io.Copy(writer, response.Body)
+	if err != nil {
+		rp.writeError(writer, err, incomingHost)
+	}
+}
+
+func (rp *ReverseProxy) writeError(writer http.ResponseWriter, err error, incomingHost string) {
+	rp.writeResponseHeader(writer, nil)
+	statusError, valid := err.(*StatusError)
+	if valid {
+		if statusError.Code == 302 {
+			loc := statusError.Error()
+			if u, err := url.Parse(statusError.Error()); err == nil {
+				if u.Host == rp.Host {
+					loc = rp.Prefix + u.Path
+					loc = strings.ReplaceAll(loc, "//", "/")
+					if u.ForceQuery || u.RawQuery != "" {
+						loc += "?"
+						loc += u.RawQuery
+					}
+					if u.Fragment != "" {
+						loc += "#"
+						loc += u.EscapedFragment()
+					}
+					if rp.Https {
+						loc = "https://" + incomingHost + loc
+					} else {
+						loc = "http://" + incomingHost + loc
+					}
+				}
+			}
+			writer.Header().Set("Location", loc)
+			writer.WriteHeader(302)
+		} else {
+			http.Error(writer, err.Error(), statusError.Code)
+		}
+	} else {
+		http.Error(writer, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (rp *ReverseProxy) writeResponseHeader(writer http.ResponseWriter, header http.Header) {
 	// Add response header
-	for h, v := range res.Header {
-		for _, v := range v {
+	for h, vs := range header {
+		for _, v := range vs {
 			writer.Header().Add(h, v)
 		}
 	}
-	if rp.allowCrossOrigin {
+	if rp.AllowCrossOrigin {
 		// Allow access origin
 		writer.Header().Set("Access-Control-Allow-Origin", "*")
 		writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		writer.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, HEAD, TRACE, DELETE, PATCH, COPY, HEAD, LINK, OPTIONS")
 	}
-	// Set status
-	writer.WriteHeader(res.StatusCode)
-	// Copy body
-	_, err = io.Copy(writer, res.Body)
-	if err != nil {
-		return err
-	}
-	return nil
 }
