@@ -3,34 +3,71 @@ package main
 import (
 	"flag"
 	"log"
+	"runtime"
 
 	"github.com/aptogeo/reverseproxy/lib"
 )
 
 func main() {
 	var listen string
-	var forward string
+	flag.StringVar(&listen, "listen", "", "host:port to listen on")
+
 	var host string
-	var prefix string
+	var forward string
+	var forwardhost string
+	flag.StringVar(&host, "host", "", "host")
+	flag.StringVar(&forward, "forward", "", "url to forward on")
+	flag.StringVar(&forwardhost, "forwardhost", "", "host rewrite header")
+
+	var allowcrossorigin bool
 	var https bool
-	var allowCrossOrigin bool
-	var crtFile string
-	var keyFile string
-	flag.StringVar(&listen, "listen", "0.0.0.0:80", "host:port to listen on")
-	flag.StringVar(&forward, "forward", "http://www.aptogeo.fr/", "url to forward on")
-	flag.StringVar(&host, "host", "www.aptogeo.fr", "host header for client request")
-	flag.StringVar(&prefix, "prefix", "/", "prefix path")
-	flag.BoolVar(&allowCrossOrigin, "allowCrossOrigin", true, "allow cross origin")
+	var crtfile string
+	var keyfile string
+	var gomaxprocs int
+	flag.BoolVar(&allowcrossorigin, "allowcrossorigin", true, "allow cross origin")
 	flag.BoolVar(&https, "https", false, "use https")
-	flag.StringVar(&crtFile, "crtFile", "", "crt file")
-	flag.StringVar(&keyFile, "keyFile", "", "key file")
+	flag.StringVar(&crtfile, "crtfile", "", "crt file")
+	flag.StringVar(&keyfile, "keyfile", "", "key file")
+	flag.IntVar(&gomaxprocs, "gomaxprocs", 4, "maximum number of CPUs")
+
 	flag.Parse()
-	reverseProxy := lib.NewReverseProxy(listen, forward, host, prefix, allowCrossOrigin)
+
+	if listen == "" {
+		log.Fatalln("missing required -listen argument")
+	}
+	if forward == "" {
+		log.Fatalln("missing required -forward argument")
+	}
+	if forwardhost == "" {
+		log.Fatalln("missing required -forwardhost argument")
+	}
 	if https {
-		reverseProxy.UseHttps(crtFile, keyFile)
+		if crtfile == "" {
+			log.Fatalln("missing -crtfile argument")
+		}
+		if keyfile == "" {
+			log.Fatalln("missing -keyfile argument")
+		}
 	}
 
-	if err := reverseProxy.Start(); err != nil {
+	runtime.GOMAXPROCS(gomaxprocs)
+
+	// Reverse proxy
+	var hostForwards []*lib.HostForward
+	hostForwards = append(
+		hostForwards, &lib.HostForward{
+			Host:        host,
+			Forward:     forward,
+			ForwardHost: forwardhost,
+		},
+	)
+
+	rp := lib.NewReverseProxy(hostForwards, listen, "/", allowcrossorigin)
+	if https {
+		rp.UseHttps(crtfile, keyfile)
+	}
+
+	if err := rp.Start(); err != nil {
 		log.Fatalln(err)
 	}
 }
