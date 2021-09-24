@@ -19,6 +19,19 @@ import (
 	"time"
 )
 
+// The contextKey type is unexported to prevent collisions with context keys defined in
+// other packages
+type contextKey string
+
+// ReverseProxyFromContext retrives GisProxy from context
+func ReverseProxyFromContext(ctx context.Context) *ReverseProxy {
+	v := ctx.Value(contextKey("ReverseProxy"))
+	if v == nil {
+		return nil
+	}
+	return v.(*ReverseProxy)
+}
+
 // HostForward struct
 type HostForward struct {
 	Host             string       // Host
@@ -50,10 +63,10 @@ func (e *StatusError) Error() string {
 }
 
 // BeforeSend defines before send callback function
-type BeforeSend func(*ReverseProxy, http.ResponseWriter, *http.Request, *HostForward) error
+type BeforeSend func(http.ResponseWriter, *http.Request, *HostForward) error
 
 // AfterReceive defines after receive callback function
-type AfterReceive func(*ReverseProxy, http.ResponseWriter, *http.Response, *HostForward) error
+type AfterReceive func(http.ResponseWriter, *http.Response, *HostForward) error
 
 // ReverseProxy structure
 type ReverseProxy struct {
@@ -153,13 +166,31 @@ func (rp *ReverseProxy) serveHTTP(writer http.ResponseWriter, incomingRequest *h
 		rp.writeError(writer, incomingRequest, errors.New("unknown host"), nil)
 		return
 	}
-	if url, err := rp.ComputeRewriteUrl(incomingRequest.URL.String(), hostForward); err != nil {
+	if forwardUrl, err := rp.ComputeForwardUrl(incomingRequest.URL.String(), hostForward); err != nil {
 		rp.writeError(writer, incomingRequest, err, hostForward)
 		return
 	} else {
-		response, err := rp.sendRequestWithContext(incomingRequest.Context(), writer, hostForward, incomingRequest.Method, url, incomingRequest.Body, incomingRequest.Header)
-		if response != nil && response.Body != nil {
-			defer response.Body.Close()
+		// Set GisProxy to context
+		ctx := context.WithValue(incomingRequest.Context(), contextKey("ReverseProxy"), rp)
+		response, err := rp.sendRequestWithContext(ctx, writer, hostForward, incomingRequest.Method, forwardUrl, incomingRequest.Body, incomingRequest.Header)
+		if response != nil {
+			if response.Body != nil {
+				defer response.Body.Close()
+			}
+		} else {
+			response = &http.Response{
+				Request: incomingRequest,
+			}
+		}
+		if hostForward.AfterReceiveFunc != nil {
+			// Call after receive function
+			if err := hostForward.AfterReceiveFunc(writer, response, hostForward); err != nil {
+				if statusError, valid := err.(*StatusError); !valid || statusError.Code >= 400 {
+					log.Println("After receive error", err, incomingRequest.URL)
+				}
+				rp.writeError(writer, incomingRequest, err, hostForward)
+				return
+			}
 		}
 		if err != nil {
 			rp.writeError(writer, incomingRequest, err, hostForward)
@@ -169,8 +200,8 @@ func (rp *ReverseProxy) serveHTTP(writer http.ResponseWriter, incomingRequest *h
 	}
 }
 
-// ComputeRewriteUrl computes rewrite url
-func (rp *ReverseProxy) ComputeRewriteUrl(incomingRequestURL string, hostForward *HostForward) (string, error) {
+// ComputeForwardUrl computes rewrite url
+func (rp *ReverseProxy) ComputeForwardUrl(incomingRequestURL string, hostForward *HostForward) (string, error) {
 	url := hostForward.Forward
 	idx := strings.Index(incomingRequestURL, "://")
 	if idx != -1 && idx < 10 {
@@ -264,10 +295,9 @@ func (rp *ReverseProxy) sendRequestWithContext(ctx context.Context, writer http.
 	}
 	if hostForward.BeforeSendFunc != nil {
 		// Call before send function
-		err := hostForward.BeforeSendFunc(rp, writer, request, hostForward)
+		err := hostForward.BeforeSendFunc(writer, request, hostForward)
 		if err != nil {
-			statusError, valid := err.(*StatusError)
-			if !valid || statusError.Code != 302 {
+			if statusError, valid := err.(*StatusError); !valid || statusError.Code >= 400 {
 				log.Println("Before send error", err, request.URL)
 			}
 			return nil, err
@@ -279,17 +309,6 @@ func (rp *ReverseProxy) sendRequestWithContext(ctx context.Context, writer http.
 
 // writeResponse writes response
 func (rp *ReverseProxy) writeResponse(writer http.ResponseWriter, request *http.Request, response *http.Response, hostForward *HostForward) {
-	if hostForward.AfterReceiveFunc != nil {
-		// Call after receive function
-		if err := hostForward.AfterReceiveFunc(rp, writer, response, hostForward); err != nil {
-			statusError, valid := err.(*StatusError)
-			if !valid || statusError.Code != 302 {
-				log.Println("After receive error", err, request.URL)
-			}
-			rp.writeError(writer, request, err, hostForward)
-			return
-		}
-	}
 	if response.StatusCode == 302 {
 		location, _ := response.Location()
 		rp.writeError(writer, request, NewStatusError(location.String(), 302), hostForward)
@@ -352,8 +371,8 @@ func (rp *ReverseProxy) writeError(writer http.ResponseWriter, request *http.Req
 			writer.Header().Set("Location", loc)
 			writer.WriteHeader(302)
 		} else {
-			log.Println("Error", http.StatusInternalServerError, err)
-			http.Error(writer, err.Error(), statusError.Code)
+			log.Println("Error", http.StatusInternalServerError, statusError.Message)
+			http.Error(writer, statusError.Message, statusError.Code)
 		}
 	} else {
 		log.Println("Error", http.StatusInternalServerError, err)
