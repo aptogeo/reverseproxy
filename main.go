@@ -19,13 +19,17 @@ func main() {
 	flag.StringVar(&forward, "forward", "", "url to forward on")
 	flag.StringVar(&forwardhost, "forwardhost", "", "host rewrite header")
 
+	var prefix string
 	var allowcrossorigin bool
 	var https bool
+	var autocertdomain string
 	var crtfile string
 	var keyfile string
 	var gomaxprocs int
+	flag.StringVar(&prefix, "prefix", "", "prefix")
 	flag.BoolVar(&allowcrossorigin, "allowcrossorigin", true, "allow cross origin")
 	flag.BoolVar(&https, "https", false, "use https")
+	flag.StringVar(&autocertdomain, "autocertdomain", "", "autocert domain")
 	flag.StringVar(&crtfile, "crtfile", "", "crt file")
 	flag.StringVar(&keyfile, "keyfile", "", "key file")
 	flag.IntVar(&gomaxprocs, "gomaxprocs", 4, "maximum number of CPUs")
@@ -42,11 +46,8 @@ func main() {
 		log.Fatalln("missing required -forwardhost argument")
 	}
 	if https {
-		if crtfile == "" {
-			log.Fatalln("missing -crtfile argument")
-		}
-		if keyfile == "" {
-			log.Fatalln("missing -keyfile argument")
+		if autocertdomain == "" && (crtfile == "" || keyfile == "") {
+			log.Fatalln("missing -autocertdomain or -crtfile and -keyfile arguments")
 		}
 	}
 
@@ -62,9 +63,14 @@ func main() {
 		},
 	)
 
-	rp := lib.NewReverseProxy(hostForwards, listen, "/", allowcrossorigin)
+	rp := lib.NewReverseProxy(hostForwards, listen, prefix, allowcrossorigin)
 	if https {
-		rp.UseHttps(crtfile, keyfile)
+		if autocertdomain != "" {
+			rp.UseAutocert(autocertdomain)
+		}
+		if crtfile != "" && keyfile != "" {
+			rp.UseCertificate(crtfile, keyfile)
+		}
 	}
 
 	if err := rp.Start(); err != nil {

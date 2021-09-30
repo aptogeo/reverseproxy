@@ -13,5 +13,5 @@ test:
 run: build
 	@echo run
 	$$GOPATH/bin/$(PRG) \
-	-listen localhost:80 \
-	-host localhost -forward  http://www.aptogeo.fr/ -forwardhost www.aptogeo.fr
+	-listen localhost:8080 \
+	-host localhost:8080 -forward  http://www.aptogeo.fr/ -forwardhost www.aptogeo.fr

@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // The contextKey type is unexported to prevent collisions with context keys defined in
@@ -77,6 +79,7 @@ type ReverseProxy struct {
 	Prefix           string
 	AllowCrossOrigin bool
 	https            bool
+	autocertdomain   string
 	crtfile          string
 	keyfile          string
 }
@@ -113,11 +116,25 @@ func NewReverseProxy(hostForwards []*HostForward, listen string, prefix string, 
 	return rp
 }
 
-// UseHttps uses Https with certificate
-func (rp *ReverseProxy) UseHttps(crtfile string, keyfile string) {
+// UseCertificate uses Https with certificate
+func (rp *ReverseProxy) UseCertificate(crtfile string, keyfile string) {
 	rp.https = true
 	rp.crtfile = crtfile
 	rp.keyfile = keyfile
+}
+
+// UseHttps uses Https with autocert
+func (rp *ReverseProxy) UseAutocert(autocertdomain string) {
+	rp.https = true
+	rp.autocertdomain = autocertdomain
+	// create the autocert.Manager with domains and path to the cache
+	certManager := autocert.Manager{
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(rp.autocertdomain),
+	}
+	rp.server.TLSConfig = &tls.Config{
+		GetCertificate: certManager.GetCertificate,
+	}
 }
 
 func (rp *ReverseProxy) Start() error {
@@ -128,6 +145,7 @@ func (rp *ReverseProxy) Start() error {
 	log.Println("AllowCrossOrigin=", rp.AllowCrossOrigin)
 	log.Println("https=", rp.https)
 	if rp.https {
+		log.Println("autocertdomain=", rp.autocertdomain)
 		log.Println("crtfile=", rp.crtfile)
 		log.Println("keyfile=", rp.keyfile)
 	}
@@ -155,6 +173,7 @@ func (rp *ReverseProxy) serveHTTP(writer http.ResponseWriter, incomingRequest *h
 	if !strings.HasSuffix(rp.Prefix, "/") {
 		rp.Prefix = rp.Prefix + "/"
 	}
+	rp.Prefix = strings.ReplaceAll(rp.Prefix, "//", "/")
 	var hostForward *HostForward
 	for _, currentHostForward := range rp.HostForwards {
 		if currentHostForward.Host == incomingRequest.Host {
@@ -209,7 +228,13 @@ func (rp *ReverseProxy) ComputeForwardUrl(incomingRequestURL string, hostForward
 	}
 	re := regexp.MustCompile("(" + rp.Prefix + ")([/\\?]?.*)?")
 	submatch := re.FindStringSubmatch(incomingRequestURL)
-	if submatch != nil && submatch[2] != "" {
+	if len(submatch) == 0 {
+		submatch = re.FindStringSubmatch(incomingRequestURL + "/")
+		if len(submatch) == 0 {
+			return "", errors.New("Prefix " + rp.Prefix + " not found in request")
+		}
+	}
+	if len(submatch) >= 3 && submatch[2] != "" {
 		if strings.HasSuffix(url, "/") {
 			if strings.HasPrefix(submatch[2], "/") {
 				url += submatch[2][1:]
@@ -223,9 +248,9 @@ func (rp *ReverseProxy) ComputeForwardUrl(incomingRequestURL string, hostForward
 				url += "/" + submatch[2]
 			}
 		}
-	} else {
-		return "", errors.New("Prefix " + rp.Prefix + " not found in request")
 	}
+	log.Println(rp.Prefix, incomingRequestURL, submatch, url)
+
 	return url, nil
 }
 
