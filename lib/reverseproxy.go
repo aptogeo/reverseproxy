@@ -249,8 +249,6 @@ func (rp *ReverseProxy) ComputeForwardUrl(incomingRequestURL string, hostForward
 			}
 		}
 	}
-	log.Println(rp.Prefix, incomingRequestURL, submatch, url)
-
 	return url, nil
 }
 
