@@ -34,6 +34,15 @@ func ReverseProxyFromContext(ctx context.Context) *ReverseProxy {
 	return v.(*ReverseProxy)
 }
 
+// IncomingRequestFromContext retrives incoming request from context
+func IncomingRequestFromContext(ctx context.Context) *http.Request {
+	v := ctx.Value(contextKey("IncomingRequest"))
+	if v == nil {
+		return nil
+	}
+	return v.(*http.Request)
+}
+
 // HostForward struct
 type HostForward struct {
 	Host             string       // Host
@@ -191,6 +200,8 @@ func (rp *ReverseProxy) serveHTTP(writer http.ResponseWriter, incomingRequest *h
 	} else {
 		// Set GisProxy to context
 		ctx := context.WithValue(incomingRequest.Context(), contextKey("ReverseProxy"), rp)
+		// Set GisProxy to context
+		ctx = context.WithValue(ctx, contextKey("IncomingRequest"), incomingRequest)
 		response, err := rp.sendRequestWithContext(ctx, writer, hostForward, incomingRequest.Method, forwardUrl, incomingRequest.Body, incomingRequest.Header)
 		if response != nil {
 			if response.Body != nil {
