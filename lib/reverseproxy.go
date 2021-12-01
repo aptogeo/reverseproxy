@@ -97,7 +97,6 @@ type AfterReceive func(http.ResponseWriter, *http.Response, *HostForward) error
 // ReverseProxy structure
 type ReverseProxy struct {
 	server           *http.Server
-	serverMux        *http.ServeMux
 	client           *http.Client
 	HostForwards     []*HostForward
 	Prefix           string
@@ -121,6 +120,7 @@ func NewReverseProxy(hostForwards []*HostForward, listen string, prefix string, 
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+		Timeout: 0,
 	}
 	rp.client.Transport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,

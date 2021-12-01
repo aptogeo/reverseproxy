@@ -10,8 +10,8 @@ test:
 	@echo test
 	go test lib/**
 
-run: build
+local: build
 	@echo run
 	$$GOPATH/bin/$(PRG) \
-	-listen localhost:8080 \
-	-host localhost:8080 -forward  http://www.aptogeo.fr/ -forwardhost www.aptogeo.fr
+	-listen localhost:8888 \
+	-host localhost:8888 -forward  http://localhost:8081/ -forwardhost localhost:8081
