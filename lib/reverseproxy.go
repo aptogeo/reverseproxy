@@ -43,6 +43,15 @@ func IncomingRequestFromContext(ctx context.Context) *http.Request {
 	return v.(*http.Request)
 }
 
+// IpFromContext retrives incoming request from context
+func IpFromContext(ctx context.Context) string {
+	v := ctx.Value(contextKey("Ip"))
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
 // HostForward struct
 type HostForward struct {
 	Host             string       // Host
@@ -59,13 +68,19 @@ func (hf *HostForward) String() string {
 
 // StatusError struct
 type StatusError struct {
-	Message string
-	Code    int
+	Message     string
+	Code        int
+	ContentType string
 }
 
 // NewStatusError constructs StatusError
 func NewStatusError(message string, code int) *StatusError {
 	return &StatusError{Message: message, Code: code}
+}
+
+// NewStatusErrorWithContentType constructs StatusError
+func NewStatusErrorWithContentType(message string, code int, contentType string) *StatusError {
+	return &StatusError{Message: message, Code: code, ContentType: contentType}
 }
 
 // Error implements the error interface
@@ -96,8 +111,7 @@ type ReverseProxy struct {
 // NewReverseProxy constructs ReverseProxy
 func NewReverseProxy(hostForwards []*HostForward, listen string, prefix string, allowCrossOrigin bool) *ReverseProxy {
 	rp := new(ReverseProxy)
-	rp.serverMux = http.NewServeMux()
-	rp.server = &http.Server{Addr: listen, Handler: rp.serverMux}
+	rp.server = &http.Server{Addr: listen, Handler: rp}
 	rp.HostForwards = hostForwards
 	rp.Prefix = prefix
 	rp.AllowCrossOrigin = allowCrossOrigin
@@ -158,7 +172,6 @@ func (rp *ReverseProxy) Start() error {
 		log.Println("crtfile=", rp.crtfile)
 		log.Println("keyfile=", rp.keyfile)
 	}
-	rp.serverMux.HandleFunc("/", rp.serveHTTP)
 	if rp.https {
 		rp.server.ListenAndServeTLS(rp.crtfile, rp.keyfile)
 	}
@@ -172,7 +185,7 @@ func (rp *ReverseProxy) Stop(timeout time.Duration) error {
 }
 
 // serveHTTP serves rest request
-func (rp *ReverseProxy) serveHTTP(writer http.ResponseWriter, incomingRequest *http.Request) {
+func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, incomingRequest *http.Request) {
 	if rp.Prefix == "" {
 		rp.Prefix = "/"
 	}
@@ -200,8 +213,21 @@ func (rp *ReverseProxy) serveHTTP(writer http.ResponseWriter, incomingRequest *h
 	} else {
 		// Set GisProxy to context
 		ctx := context.WithValue(incomingRequest.Context(), contextKey("ReverseProxy"), rp)
-		// Set GisProxy to context
+		// Set Ip to context
+		ip := ""
+		if incomingRequest != nil {
+			ip = incomingRequest.Header.Get("X-Real-IP")
+			if ip == "" {
+				ip = incomingRequest.Header.Get("X-Forwarded-For")
+			}
+			if ip == "" {
+				ip = strings.Split(incomingRequest.RemoteAddr, ":")[0]
+			}
+		}
+		ctx = context.WithValue(ctx, contextKey("Ip"), ip)
+		// Set IncomingRequest to context
 		ctx = context.WithValue(ctx, contextKey("IncomingRequest"), incomingRequest)
+		// Send
 		response, err := rp.sendRequestWithContext(ctx, writer, hostForward, incomingRequest.Method, forwardUrl, incomingRequest.Body, incomingRequest.Header)
 		if response != nil {
 			if response.Body != nil {
@@ -296,7 +322,9 @@ func (rp *ReverseProxy) RewriteHostResponseBody(response *http.Response) error {
 	}
 	for _, currentHostForward := range rp.HostForwards {
 		if currentHostForward.ForwardHost != "" {
-			byteBody = bytes.ReplaceAll(byteBody, []byte(currentHostForward.ForwardHost), []byte(currentHostForward.Host))
+			re := regexp.MustCompile(regexp.QuoteMeta(currentHostForward.ForwardHost) + "([^:]{1}|$)")
+			trimedPrefix := strings.TrimLeft(rp.Prefix, "/")
+			byteBody = []byte(re.ReplaceAllString(string(byteBody), currentHostForward.Host+"$1"+trimedPrefix))
 		}
 	}
 	body := ioutil.NopCloser(bytes.NewReader(byteBody))
@@ -366,42 +394,13 @@ func (rp *ReverseProxy) writeError(writer http.ResponseWriter, request *http.Req
 	if valid {
 		if statusError.Code == 200 {
 			writer.Write([]byte(statusError.Message))
+			if statusError.ContentType != "" {
+				writer.Header().Set("Content-Type", statusError.ContentType)
+			}
 		} else if statusError.Code == 302 {
 			loc := statusError.Message
 			// Rewrite location
-			fragment := ""
-			if strings.Contains(loc, "#") {
-				strs := strings.Split(loc, "#")
-				fragment = "#" + strs[1]
-				loc = strs[0]
-			}
-			if u, err := url.Parse(loc); err == nil {
-				path := rp.Prefix + u.Path
-				path = strings.ReplaceAll(path, "//", "/")
-				query := ""
-				if u.ForceQuery || u.RawQuery != "" {
-					query += "?"
-					query += u.RawQuery
-				}
-				host := u.Host
-				for _, currentHostForward := range rp.HostForwards {
-					if currentHostForward.ForwardHost != "" {
-						// Host
-						host = strings.ReplaceAll(host, currentHostForward.ForwardHost, currentHostForward.Host)
-						// Query
-						u.RawQuery = strings.ReplaceAll(u.RawQuery, currentHostForward.ForwardHost, url.QueryEscape(currentHostForward.Host))
-						u.RawQuery = strings.ReplaceAll(u.RawQuery, url.QueryEscape(currentHostForward.ForwardHost), url.QueryEscape(currentHostForward.Host))
-						// Fragment
-						fragment = strings.ReplaceAll(fragment, currentHostForward.ForwardHost, url.QueryEscape(currentHostForward.Host))
-						fragment = strings.ReplaceAll(fragment, url.QueryEscape(currentHostForward.ForwardHost), url.QueryEscape(currentHostForward.Host))
-					}
-				}
-				if u.Scheme != "" && host != "" {
-					loc = u.Scheme + "://" + host + path + query + fragment
-				} else {
-					loc = path + query + fragment
-				}
-			}
+			loc = rp.RewriteLocation(loc)
 			writer.Header().Set("Location", loc)
 			writer.WriteHeader(302)
 		} else {
@@ -434,4 +433,49 @@ func (rp *ReverseProxy) writeResponseHeader(writer http.ResponseWriter, request 
 			writer.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, HEAD, TRACE, DELETE, PATCH, COPY, HEAD, LINK, OPTIONS")
 		}
 	}
+}
+
+// RewriteLocation rewrites location
+func (rp *ReverseProxy) RewriteLocation(location string) string {
+	rewrited := ""
+	if u, err := url.Parse(location); err == nil {
+		path := rp.Prefix + u.Path
+		path = strings.ReplaceAll(path, "//", "/")
+		query := ""
+		if u.ForceQuery || u.RawQuery != "" {
+			query += "?"
+			query += u.RawQuery
+		}
+		fragment := ""
+		if u.Fragment != "" {
+			fragment = "#" + u.Fragment
+		}
+		host := u.Host
+		for _, currentHostForward := range rp.HostForwards {
+			if currentHostForward.ForwardHost != "" {
+				// Host
+				if host == currentHostForward.ForwardHost {
+					host = currentHostForward.Host
+				}
+				// Query
+				re := regexp.MustCompile(regexp.QuoteMeta(currentHostForward.ForwardHost) + "([^:]{1}|$)")
+				reEscaped := regexp.MustCompile(regexp.QuoteMeta(url.QueryEscape(currentHostForward.ForwardHost)) + "([^:]{1}|$)")
+				trimedPrefix := strings.TrimLeft(rp.Prefix, "/")
+				query = re.ReplaceAllString(query, url.QueryEscape(currentHostForward.Host)+"$1"+trimedPrefix)
+				query = reEscaped.ReplaceAllString(query, url.QueryEscape(currentHostForward.Host)+"$1"+trimedPrefix)
+				// Fragment
+				fragment = re.ReplaceAllString(fragment, url.QueryEscape(currentHostForward.Host)+"$1"+trimedPrefix)
+				fragment = reEscaped.ReplaceAllString(fragment, url.QueryEscape(currentHostForward.Host)+"$1"+trimedPrefix)
+			}
+		}
+		if u.Scheme != "" && host != "" {
+			rewrited = u.Scheme + "://" + host + path + query + fragment
+		} else {
+			rewrited = path + query + fragment
+		}
+		if location != rewrited {
+			log.Println("Location rewrited:", location, "->", rewrited)
+		}
+	}
+	return rewrited
 }

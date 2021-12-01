@@ -36,7 +36,7 @@ func TestReverseProxy(t *testing.T) {
 		},
 	)
 	rp := lib.NewReverseProxy(hostForwards, "localhost:8586", "/", true)
-	defer rp.Stop(time.Second)
+	defer rp.Stop(0)
 	go rp.Start()
 
 	if response, err := http.Get("http://localhost:8586/path/to/resource/"); err != nil {
@@ -75,7 +75,7 @@ func TestReverseProxyWithPrefix(t *testing.T) {
 		},
 	)
 	rp := lib.NewReverseProxy(hostForwards, "localhost:8586", "/prefix", true)
-	defer rp.Stop(time.Second)
+	defer rp.Stop(0)
 	go rp.Start()
 
 	if response, err := http.Get("http://localhost:8586/path/to/resource/"); err != nil {
@@ -160,5 +160,41 @@ func TestReverseProxyBeforeSendInError(t *testing.T) {
 				t.Fatalf("Received %v; expexted %v", received, expected)
 			}
 		}
+	}
+}
+
+func TestRewriteLocation(t *testing.T) {
+	var hostForwards []*lib.HostForward
+	hostForwards = append(
+		hostForwards, &lib.HostForward{
+			Host:             "external.host.fr",
+			Forward:          "http://server.forward/forward/",
+			ForwardHost:      "internal.host.fr",
+			BeforeSendFunc:   nil,
+			AfterReceiveFunc: nil,
+		},
+	)
+	rp := lib.NewReverseProxy(hostForwards, "localhost:8586", "/", true)
+	received := rp.RewriteLocation("https://internal.host.fr/path/to/?redirect1=https://internal.host.fr/redirect&redirect2=https://internal.host.fr:1234/redirect#redirect3=https://internal.host.fr/redirect&redirect4=https://internal.host.fr:1234/redirect")
+	expected := "https://external.host.fr/path/to/?redirect1=https://external.host.fr/redirect&redirect2=https://internal.host.fr:1234/redirect#redirect3=https://external.host.fr/redirect&redirect4=https://internal.host.fr:1234/redirect"
+	if received != expected {
+		t.Fatalf("Received %v; expected %v", received, expected)
+	}
+	received = rp.RewriteLocation("https://internal.host.fr:4567/path/to/?redirect1=https://internal.host.fr/redirect&redirect2=https://internal.host.fr:1234/redirect#redirect3=https://internal.host.fr/redirect&redirect4=https://internal.host.fr:1234/redirect")
+	expected = "https://internal.host.fr:4567/path/to/?redirect1=https://external.host.fr/redirect&redirect2=https://internal.host.fr:1234/redirect#redirect3=https://external.host.fr/redirect&redirect4=https://internal.host.fr:1234/redirect"
+	if received != expected {
+		t.Fatalf("Received %v; expected %v", received, expected)
+	}
+
+	rp = lib.NewReverseProxy(hostForwards, "localhost:8586", "/prefix/", true)
+	received = rp.RewriteLocation("https://internal.host.fr/path/to/?redirect1=https://internal.host.fr/redirect&redirect2=https://internal.host.fr:1234/redirect#redirect3=https://internal.host.fr/redirect&redirect4=https://internal.host.fr:1234/redirect")
+	expected = "https://external.host.fr/prefix/path/to/?redirect1=https://external.host.fr/redirect&redirect2=https://internal.host.fr:1234/redirect#redirect3=https://external.host.fr/redirect&redirect4=https://internal.host.fr:1234/redirect"
+	if received != expected {
+		t.Fatalf("Received %v; expected %v", received, expected)
+	}
+	received = rp.RewriteLocation("https://internal.host.fr:4567/path/to/?redirect1=https://internal.host.fr/redirect&redirect2=https://internal.host.fr:1234/redirect#redirect3=https://internal.host.fr/redirect&redirect4=https://internal.host.fr:1234/redirect")
+	expected = "https://internal.host.fr:4567/prefix/path/to/?redirect1=https://external.host.fr/redirect&redirect2=https://internal.host.fr:1234/redirect#redirect3=https://external.host.fr/redirect&redirect4=https://internal.host.fr:1234/redirect"
+	if received != expected {
+		t.Fatalf("Received %v; expected %v", received, expected)
 	}
 }
