@@ -4,10 +4,12 @@ PRG = reverseproxy
 
 build:
 	@echo build
+	@go get
 	@go install
 
 test:
 	@echo test
+	@go get
 	go test lib/**
 
 local: build

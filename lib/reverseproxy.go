@@ -184,7 +184,7 @@ func (rp *ReverseProxy) Stop(timeout time.Duration) error {
 	return rp.server.Shutdown(ctx)
 }
 
-// serveHTTP serves rest request
+// ServeHTTP serves rest request
 func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, incomingRequest *http.Request) {
 	if rp.Prefix == "" {
 		rp.Prefix = "/"
@@ -204,11 +204,11 @@ func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, incomingRequest *h
 		}
 	}
 	if hostForward == nil {
-		rp.writeError(writer, incomingRequest, errors.New("unknown host"), nil)
+		rp.writeError(writer, incomingRequest, errors.New("unknown host"), nil, nil)
 		return
 	}
 	if forwardUrl, err := rp.ComputeForwardUrl(incomingRequest.URL.String(), hostForward); err != nil {
-		rp.writeError(writer, incomingRequest, err, hostForward)
+		rp.writeError(writer, incomingRequest, err, hostForward, nil)
 		return
 	} else {
 		// Set GisProxy to context
@@ -244,12 +244,12 @@ func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, incomingRequest *h
 				if statusError, valid := err.(*StatusError); !valid || statusError.Code >= 400 {
 					log.Println("After receive error", err, incomingRequest.URL)
 				}
-				rp.writeError(writer, incomingRequest, err, hostForward)
+				rp.writeError(writer, incomingRequest, err, hostForward, nil)
 				return
 			}
 		}
 		if err != nil {
-			rp.writeError(writer, incomingRequest, err, hostForward)
+			rp.writeError(writer, incomingRequest, err, hostForward, nil)
 			return
 		}
 		rp.writeResponse(writer, incomingRequest, response, hostForward)
@@ -373,7 +373,7 @@ func (rp *ReverseProxy) sendRequestWithContext(ctx context.Context, writer http.
 func (rp *ReverseProxy) writeResponse(writer http.ResponseWriter, request *http.Request, response *http.Response, hostForward *HostForward) {
 	if response.StatusCode == 302 {
 		location, _ := response.Location()
-		rp.writeError(writer, request, NewStatusError(location.String(), 302), hostForward)
+		rp.writeError(writer, request, NewStatusError(location.String(), 302), hostForward, response.Header)
 		return
 	}
 	// Write header
@@ -383,20 +383,23 @@ func (rp *ReverseProxy) writeResponse(writer http.ResponseWriter, request *http.
 	// Copy body
 	if _, err := io.Copy(writer, response.Body); err != nil {
 		log.Println("Copy response error")
-		rp.writeError(writer, request, err, hostForward)
+		rp.writeError(writer, request, err, hostForward, nil)
 	}
 }
 
 // writeResponse writes error
-func (rp *ReverseProxy) writeError(writer http.ResponseWriter, request *http.Request, err error, hostForward *HostForward) {
-	rp.writeResponseHeader(writer, request, nil)
+func (rp *ReverseProxy) writeError(writer http.ResponseWriter, request *http.Request, err error, hostForward *HostForward, header http.Header) {
+	rp.writeResponseHeader(writer, request, header)
 	statusError, valid := err.(*StatusError)
 	if valid {
 		if statusError.Code == 200 {
-			writer.Write([]byte(statusError.Message))
 			if statusError.ContentType != "" {
 				writer.Header().Set("Content-Type", statusError.ContentType)
+			} else {
+				writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			}
+			writer.WriteHeader(200)
+			writer.Write([]byte(statusError.Message))
 		} else if statusError.Code == 302 {
 			loc := statusError.Message
 			// Rewrite location
@@ -405,11 +408,19 @@ func (rp *ReverseProxy) writeError(writer http.ResponseWriter, request *http.Req
 			writer.WriteHeader(302)
 		} else {
 			log.Println("Error", http.StatusInternalServerError, statusError.Message)
-			http.Error(writer, statusError.Message, statusError.Code)
+			if statusError.ContentType != "" {
+				writer.Header().Set("Content-Type", statusError.ContentType)
+			} else {
+				writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			}
+			writer.WriteHeader(statusError.Code)
+			writer.Write([]byte(statusError.Message))
 		}
 	} else {
 		log.Println("Error", http.StatusInternalServerError, err)
-		http.Error(writer, err.Error(), http.StatusInternalServerError)
+		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		writer.WriteHeader(http.StatusInternalServerError)
+		writer.Write([]byte(err.Error()))
 	}
 }
 
@@ -447,7 +458,9 @@ func (rp *ReverseProxy) RewriteLocation(location string) string {
 			query += u.RawQuery
 		}
 		fragment := ""
-		if u.Fragment != "" {
+		if u.RawFragment != "" {
+			fragment = "#" + u.RawFragment
+		} else if u.Fragment != "" {
 			fragment = "#" + u.Fragment
 		}
 		host := u.Host
