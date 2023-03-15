@@ -160,6 +160,7 @@ func (rp *ReverseProxy) UseAutocert(autocertdomain string) {
 	}
 }
 
+// Start starts server
 func (rp *ReverseProxy) Start() error {
 	log.Println("Start server")
 	log.Println("HostForwards=", rp.HostForwards)
@@ -178,6 +179,7 @@ func (rp *ReverseProxy) Start() error {
 	return rp.server.ListenAndServe()
 }
 
+// Stop stops server
 func (rp *ReverseProxy) Stop(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -186,16 +188,74 @@ func (rp *ReverseProxy) Stop(timeout time.Duration) error {
 
 // ServeHTTP serves rest request
 func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, incomingRequest *http.Request) {
-	if rp.Prefix == "" {
-		rp.Prefix = "/"
+	rp.checkPrefix()
+	hostForward := rp.RetrieveHostForward(incomingRequest)
+	for _, currentHostForward := range rp.HostForwards {
+		if currentHostForward.Host == "*" || currentHostForward.Host == incomingRequest.Host {
+			hostForward = currentHostForward
+			break
+		}
 	}
-	if !strings.HasPrefix(rp.Prefix, "/") {
-		rp.Prefix = "/" + rp.Prefix
+	if hostForward == nil {
+		rp.WriteError(writer, incomingRequest, errors.New("unknown host for "+incomingRequest.Host), nil)
+		return
 	}
-	if !strings.HasSuffix(rp.Prefix, "/") {
-		rp.Prefix = rp.Prefix + "/"
+	if forwardUrl, err := rp.ComputeForwardUrl(incomingRequest.URL.String(), hostForward); err != nil {
+		rp.WriteError(writer, incomingRequest, err, nil)
+		return
+	} else {
+		rp.Forward(writer, incomingRequest, forwardUrl, hostForward)
 	}
-	rp.Prefix = strings.ReplaceAll(rp.Prefix, "//", "/")
+}
+
+// Forward forwards rest request
+func (rp *ReverseProxy) Forward(writer http.ResponseWriter, incomingRequest *http.Request, forwardUrl string, hostForward *HostForward) {
+	// Set GisProxy to context
+	ctx := context.WithValue(incomingRequest.Context(), contextKey("ReverseProxy"), rp)
+	// Set Ip to context
+	ip := ""
+	if incomingRequest != nil {
+		ip = incomingRequest.Header.Get("X-Real-IP")
+		if ip == "" {
+			ip = incomingRequest.Header.Get("X-Forwarded-For")
+		}
+		if ip == "" {
+			ip = strings.Split(incomingRequest.RemoteAddr, ":")[0]
+		}
+	}
+	ctx = context.WithValue(ctx, contextKey("Ip"), ip)
+	// Set IncomingRequest to context
+	ctx = context.WithValue(ctx, contextKey("IncomingRequest"), incomingRequest)
+	// Send
+	response, err := rp.sendRequestWithContext(ctx, writer, hostForward, incomingRequest.Method, forwardUrl, incomingRequest.Body, incomingRequest.Header)
+	if response != nil {
+		if response.Body != nil {
+			defer response.Body.Close()
+		}
+	} else {
+		response = &http.Response{
+			Request: incomingRequest,
+		}
+	}
+	if hostForward.AfterReceiveFunc != nil {
+		// Call after receive function
+		if err := hostForward.AfterReceiveFunc(writer, response, hostForward); err != nil {
+			if statusError, valid := err.(*StatusError); !valid || statusError.Code >= 400 {
+				log.Println("After receive error", err, incomingRequest.URL)
+			}
+			rp.WriteError(writer, incomingRequest, err, nil)
+			return
+		}
+	}
+	if err != nil {
+		rp.WriteError(writer, incomingRequest, err, nil)
+		return
+	}
+	rp.WriteResponse(writer, incomingRequest, response)
+}
+
+// RetrieveHostForward retrieves hostForward
+func (rp *ReverseProxy) RetrieveHostForward(incomingRequest *http.Request) *HostForward {
 	var hostForward *HostForward
 	for _, currentHostForward := range rp.HostForwards {
 		if currentHostForward.Host == incomingRequest.Host {
@@ -203,57 +263,7 @@ func (rp *ReverseProxy) ServeHTTP(writer http.ResponseWriter, incomingRequest *h
 			break
 		}
 	}
-	if hostForward == nil {
-		rp.writeError(writer, incomingRequest, errors.New("unknown host"), nil, nil)
-		return
-	}
-	if forwardUrl, err := rp.ComputeForwardUrl(incomingRequest.URL.String(), hostForward); err != nil {
-		rp.writeError(writer, incomingRequest, err, hostForward, nil)
-		return
-	} else {
-		// Set GisProxy to context
-		ctx := context.WithValue(incomingRequest.Context(), contextKey("ReverseProxy"), rp)
-		// Set Ip to context
-		ip := ""
-		if incomingRequest != nil {
-			ip = incomingRequest.Header.Get("X-Real-IP")
-			if ip == "" {
-				ip = incomingRequest.Header.Get("X-Forwarded-For")
-			}
-			if ip == "" {
-				ip = strings.Split(incomingRequest.RemoteAddr, ":")[0]
-			}
-		}
-		ctx = context.WithValue(ctx, contextKey("Ip"), ip)
-		// Set IncomingRequest to context
-		ctx = context.WithValue(ctx, contextKey("IncomingRequest"), incomingRequest)
-		// Send
-		response, err := rp.sendRequestWithContext(ctx, writer, hostForward, incomingRequest.Method, forwardUrl, incomingRequest.Body, incomingRequest.Header)
-		if response != nil {
-			if response.Body != nil {
-				defer response.Body.Close()
-			}
-		} else {
-			response = &http.Response{
-				Request: incomingRequest,
-			}
-		}
-		if hostForward.AfterReceiveFunc != nil {
-			// Call after receive function
-			if err := hostForward.AfterReceiveFunc(writer, response, hostForward); err != nil {
-				if statusError, valid := err.(*StatusError); !valid || statusError.Code >= 400 {
-					log.Println("After receive error", err, incomingRequest.URL)
-				}
-				rp.writeError(writer, incomingRequest, err, hostForward, nil)
-				return
-			}
-		}
-		if err != nil {
-			rp.writeError(writer, incomingRequest, err, hostForward, nil)
-			return
-		}
-		rp.writeResponse(writer, incomingRequest, response, hostForward)
-	}
+	return hostForward
 }
 
 // ComputeForwardUrl computes rewrite url
@@ -287,6 +297,20 @@ func (rp *ReverseProxy) ComputeForwardUrl(incomingRequestURL string, hostForward
 		}
 	}
 	return url, nil
+}
+
+// checkPrefix checks prefix
+func (rp *ReverseProxy) checkPrefix() {
+	if rp.Prefix == "" {
+		rp.Prefix = "/"
+	}
+	if !strings.HasPrefix(rp.Prefix, "/") {
+		rp.Prefix = "/" + rp.Prefix
+	}
+	if !strings.HasSuffix(rp.Prefix, "/") {
+		rp.Prefix = rp.Prefix + "/"
+	}
+	rp.Prefix = strings.ReplaceAll(rp.Prefix, "//", "/")
 }
 
 // RewriteHostQueryRequest computes rewrite query
@@ -369,27 +393,27 @@ func (rp *ReverseProxy) sendRequestWithContext(ctx context.Context, writer http.
 	return rp.client.Do(request)
 }
 
-// writeResponse writes response
-func (rp *ReverseProxy) writeResponse(writer http.ResponseWriter, request *http.Request, response *http.Response, hostForward *HostForward) {
+// WriteResponse writes response
+func (rp *ReverseProxy) WriteResponse(writer http.ResponseWriter, request *http.Request, response *http.Response) {
 	if response.StatusCode == 302 {
 		location, _ := response.Location()
-		rp.writeError(writer, request, NewStatusError(location.String(), 302), hostForward, response.Header)
+		rp.WriteError(writer, request, NewStatusError(location.String(), 302), response.Header)
 		return
 	}
 	// Write header
-	rp.writeResponseHeader(writer, request, response.Header)
+	rp.WriteResponseHeader(writer, request, response.Header)
 	// Set status
 	writer.WriteHeader(response.StatusCode)
 	// Copy body
 	if _, err := io.Copy(writer, response.Body); err != nil {
 		log.Println("Copy response error")
-		rp.writeError(writer, request, err, hostForward, nil)
+		rp.WriteError(writer, request, err, nil)
 	}
 }
 
 // writeResponse writes error
-func (rp *ReverseProxy) writeError(writer http.ResponseWriter, request *http.Request, err error, hostForward *HostForward, header http.Header) {
-	rp.writeResponseHeader(writer, request, header)
+func (rp *ReverseProxy) WriteError(writer http.ResponseWriter, request *http.Request, err error, header http.Header) {
+	rp.WriteResponseHeader(writer, request, header)
 	statusError, valid := err.(*StatusError)
 	if valid {
 		if statusError.Code == 200 {
@@ -424,8 +448,8 @@ func (rp *ReverseProxy) writeError(writer http.ResponseWriter, request *http.Req
 	}
 }
 
-// writeResponseHeader writes response header
-func (rp *ReverseProxy) writeResponseHeader(writer http.ResponseWriter, request *http.Request, header http.Header) {
+// WriteResponseHeader writes response header
+func (rp *ReverseProxy) WriteResponseHeader(writer http.ResponseWriter, request *http.Request, header http.Header) {
 	// Add response header
 	for h, vs := range header {
 		for _, v := range vs {
